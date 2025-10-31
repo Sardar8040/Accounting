@@ -1098,6 +1098,27 @@ async def get_sale_by_id(db_path: str, sale_id: int) -> Optional[Dict[str, Any]]
     return await asyncio.to_thread(_fn)
 
 
+async def get_sales_by_numbers(db_path: str, numbers: list) -> List[Dict[str, Any]]:
+    """Return sales rows matching any of the given numbers.
+
+    Returns list of dicts with keys: number, report_date, username
+    """
+    def _fn():
+        if not numbers:
+            return []
+        conn = get_connection(db_path)
+        cur = conn.cursor()
+        # build placeholders safely
+        placeholders = ",".join(["?"] * len(numbers))
+        query = f"SELECT sa.number as number, sa.report_date as report_date, st.username as username FROM sales sa JOIN staff st ON sa.staff_id = st.id WHERE sa.number IN ({placeholders})"
+        cur.execute(query, numbers)
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    return await asyncio.to_thread(_fn)
+
+
 async def get_all_sales_by_date_for_shop(db_path: str, date: Optional[str] = None, shop_id: int = None) -> List[Dict[str, Any]]:
     def _fn():
         d = date or datetime.date.today().isoformat()

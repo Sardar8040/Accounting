@@ -553,6 +553,83 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # replace entries with filtered list so subsequent summaries and DB insertion exclude duplicates
     entries = filtered_entries
 
+    # ---------------- Step 4.75: check DB for already-sold GSM numbers (global duplicates)
+    # Build list of candidate GSM/number identifiers from the parsed entries
+    duplicates_detected = []
+    try:
+        candidate_numbers = []
+        for e in entries:
+            try:
+                item_code = (e.get("item_code") or "").lower()
+                if item_code not in ("sim", "simcard", "sim_card"):
+                    continue
+                gsm = e.get("gsm_number") or e.get("GSM") or None
+                store_number = None
+                if gsm and str(gsm).strip():
+                    store_number = str(gsm).strip()
+                else:
+                    raw_number = e.get("number")
+                    if raw_number is not None:
+                        s = str(raw_number).strip()
+                        if s.isdigit() and len(s) >= 6:
+                            store_number = s
+                if store_number:
+                    candidate_numbers.append(store_number)
+            except Exception:
+                continue
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_candidates = []
+        for n in candidate_numbers:
+            if n in seen:
+                continue
+            seen.add(n)
+            unique_candidates.append(n)
+
+        if unique_candidates:
+            existing = await models.get_sales_by_numbers(db_path, unique_candidates)
+            # map number -> first matching row
+            existing_map = {r.get("number"): r for r in existing}
+
+            filtered = []
+            for e in entries:
+                try:
+                    item_code = (e.get("item_code") or "").lower()
+                    if item_code not in ("sim", "simcard", "sim_card"):
+                        filtered.append(e)
+                        continue
+                    gsm = e.get("gsm_number") or e.get("GSM") or None
+                    store_number = None
+                    if gsm and str(gsm).strip():
+                        store_number = str(gsm).strip()
+                    else:
+                        raw_number = e.get("number")
+                        if raw_number is not None:
+                            s = str(raw_number).strip()
+                            if s.isdigit() and len(s) >= 6:
+                                store_number = s
+
+                    if store_number and store_number in existing_map:
+                        # record duplicate info (number and original sale date/user)
+                        row = existing_map.get(store_number)
+                        duplicates_detected.append({
+                            "number": store_number,
+                            "report_date": row.get("report_date"),
+                            "username": row.get("username"),
+                        })
+                        # skip inserting this row
+                        continue
+                    # otherwise keep row for insertion
+                    filtered.append(e)
+                except Exception:
+                    # on any unexpected error, keep the row to avoid data loss
+                    filtered.append(e)
+
+            entries = filtered
+    except Exception:
+        logger.exception("Failed to detect DB-level duplicate GSM numbers; proceeding with insertion")
+
     # ---------------- Step 5: ensure staff ----------------
     try:
         staff_id = await models.ensure_staff(db_path, username, name)
@@ -751,13 +828,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if warning_lines:
         await update.message.reply_text("\n".join(warning_lines))
 
-    try:
-        await update.message.reply_text("\n".join(msg_lines))
-        # notify employee about duplicate rows if any
-        if isinstance(result, dict) and result.get("duplicates_skipped"):
-            await update.message.reply_text("⚠️ Some rows were duplicates and were ignored. Only new entries were processed.")
-    except Exception:
-        logger.exception("Failed to send upload summary message to employee")
+        try:
+            await update.message.reply_text("\n".join(msg_lines))
+            # notify employee about duplicate rows if any
+            # Prefer explicit duplicates_detected list (with dates) when available
+            if duplicates_detected:
+                lines = ["⚠️ Some rows were duplicates and were ignored.", "Duplicates:"]
+                for d in duplicates_detected:
+                    lines.append(f"GSM Number: {d.get('number')}, Sold on: {d.get('report_date')}, By: {d.get('username')}")
+                lines.append("Only new entries were processed successfully.")
+                await update.message.reply_text("\n".join(lines))
+            elif isinstance(result, dict) and result.get("duplicates_skipped"):
+                await update.message.reply_text("⚠️ Some rows were duplicates and were ignored. Only new entries were processed.")
+        except Exception:
+            logger.exception("Failed to send upload summary message to employee")
 
     # Notify admins (by stored chat_id) with the same summary
     try:
