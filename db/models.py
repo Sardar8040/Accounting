@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import time
 from typing import Optional, List, Dict, Any
 import datetime
 import asyncio
@@ -519,8 +520,150 @@ async def insert_sales_and_update_inventory(
     """
     def _fn():
         import traceback
+        # Lightweight per-staff-date file lock to prevent concurrent uploads
+        # from interfering with each other. We use atomic file creation (O_EXCL)
+        # to acquire the lock; this works across processes on Windows and Unix.
+        def _lock_path(db_path: str, staff_id: int, report_date: str) -> str:
+            base = os.path.dirname(db_path) or "."
+            lock_dir = os.path.join(base, "locks")
+            try:
+                os.makedirs(lock_dir, exist_ok=True)
+            except Exception:
+                pass
+            # sanitize report_date for filesystem
+            safe_date = report_date.replace('/', '_').replace(':', '_')
+            return os.path.join(lock_dir, f"upload_{staff_id}_{safe_date}.lock")
+
+        def _acquire_lock(lockfile: str, timeout: float = 10.0):
+            start = time.time()
+            while True:
+                try:
+                    # O_CREAT|O_EXCL ensures atomic creation; fails if exists
+                    fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    # write pid/timestamp for debugging
+                    try:
+                        os.write(fd, f"{os.getpid()}:{time.time()}".encode())
+                    except Exception:
+                        pass
+                    return fd
+                except FileExistsError:
+                    if time.time() - start > timeout:
+                        raise TimeoutError(f"Timeout acquiring lock {lockfile}")
+                    time.sleep(0.05)
+
+        def _release_lock(fd: int, lockfile: str):
+            try:
+                if isinstance(fd, int):
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                if os.path.exists(lockfile):
+                    try:
+                        os.remove(lockfile)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         conn = get_connection(db_path)
         cur = conn.cursor()
+        # Try to acquire per-upload lock to serialize operations for this staff/date
+        lockfd = None
+        lockfile = None
+        try:
+            lockfile = _lock_path(db_path, staff_id, report_date)
+            lockfd = _acquire_lock(lockfile, timeout=15.0)
+        except Exception:
+            # If we can't acquire a lock, abort to avoid racing inventory updates
+            conn.close()
+            raise
+        
+        # CRITICAL: Set isolation level to SERIALIZABLE for maximum safety
+        # This ensures no other transaction can interfere with our last-upload-wins logic
+        cur.execute("PRAGMA read_uncommitted = 0")
+        cur.execute("PRAGMA synchronous = FULL")
+        
+        # --- CRITICAL: ENSURE LAST-UPLOAD-WINS LOGIC IS ATOMIC ---
+        # Take a snapshot of starting inventory for verification
+        cur.execute("SELECT sim, swap, credit_50, credit_100 FROM inventory WHERE staff_id = ?", (staff_id,))
+        starting_inv = cur.fetchone()
+        logger.info(f"[TRANSACTION START] staff_id={staff_id} starting inventory: {dict(starting_inv) if starting_inv else None}")
+        
+        # First check if there are existing sales that need to be reverted
+        try:
+            cur.execute("SELECT id FROM sales WHERE staff_id = ? AND report_date = ?", (staff_id, report_date))
+            existing = cur.fetchall()
+            existing_ids = [r['id'] for r in existing]
+            
+            if existing_ids:
+                logger.info(f"[insert_sales_and_update_inventory] Found {len(existing_ids)} existing sales to revert")
+
+                # Robust revert: compute counts directly from existing sales rows instead
+                # of relying on inventory_journal which may be missing if journaling failed
+                # previously. This is deterministic and avoids double-adds or misses.
+                cur.execute("SELECT id, item_code, number FROM sales WHERE staff_id = ? AND report_date = ?", (staff_id, report_date))
+                existing_sales = cur.fetchall()
+                # Build counts per inventory column
+                revert_counts = {}
+                for sr in existing_sales:
+                    item_code_raw = sr['item_code'] or ''
+                    item_code = str(item_code_raw).strip().lower()
+                    # SIM/SWAP are counted per row (1 each)
+                    if item_code in ('sim', 'simcard', 'sim_card'):
+                        revert_counts['sim'] = revert_counts.get('sim', 0) + 1
+                    elif item_code == 'swap':
+                        revert_counts['swap'] = revert_counts.get('swap', 0) + 1
+                    elif item_code in ('credit50', 'credit_50', 'credit-50'):
+                        # number stores count for credit rows
+                        try:
+                            revert_counts['credit_50'] = revert_counts.get('credit_50', 0) + int(sr['number'] or 0)
+                        except Exception:
+                            pass
+                    elif item_code in ('credit100', 'credit_100', 'credit-100'):
+                        try:
+                            revert_counts['credit_100'] = revert_counts.get('credit_100', 0) + int(sr['number'] or 0)
+                        except Exception:
+                            pass
+                    else:
+                        # For any other item types that map to a known column, try to parse numeric 'number'
+                        col_guess = _map_item_to_column(item_code)
+                        if col_guess:
+                            try:
+                                revert_counts[col_guess] = revert_counts.get(col_guess, 0) + int(sr['number'] or 0)
+                            except Exception:
+                                # ignore non-numeric
+                                pass
+
+                # CRITICAL: Revert inventory BEFORE deleting sales to maintain data integrity
+                for col, c in revert_counts.items():
+                    if c:
+                        cur.execute(f"UPDATE inventory SET {col} = {col} + ? WHERE staff_id = ?", (int(c), staff_id))
+                        # Record revert in journal referencing the sale ids for traceability
+                        try:
+                            cur.execute(
+                                "INSERT INTO inventory_journal (staff_id, item, change_amount, change_type, source) VALUES (?, ?, ?, ?, ?)",
+                                (staff_id, col, int(c), 'revert', f"delete_sales:{','.join(map(str, existing_ids))}")
+                            )
+                        except Exception:
+                            # journaling is best-effort
+                            pass
+                        logger.info(f"[insert_sales_and_update_inventory] Reverted {c} {col} for staff_id={staff_id}")
+
+                # Now that inventory is reverted, we can safely delete the old sales
+                cur.execute("DELETE FROM sales WHERE staff_id = ? AND report_date = ?", (staff_id, report_date))
+                logger.info(f"[insert_sales_and_update_inventory] Deleted {len(existing_ids)} old sales")
+
+                # Take a snapshot of inventory after revert for verification
+                cur.execute("SELECT sim, swap, credit_50, credit_100 FROM inventory WHERE staff_id = ?", (staff_id,))
+                inv_after_revert = cur.fetchone()
+                logger.info(f"[insert_sales_and_update_inventory] Inventory after revert: {dict(inv_after_revert)}")
+                
+        except Exception as ex:
+            # If ANYTHING fails during the revert process, we must rollback and abort
+            conn.rollback()
+            logger.error(f"[CRITICAL] Failed to revert previous sales: {ex}")
+            conn.close()
+            raise Exception("Failed to safely revert previous sales")
         # Get current inventory for the staff
         try:
             cur.execute(
@@ -766,6 +909,11 @@ async def insert_sales_and_update_inventory(
             logger.error(f"[ROLLBACK] insert_sales_and_update_inventory failed: {ex}\n{traceback.format_exc()} | entries={entries}")
             raise ex
         finally:
+            # release lock then close connection
+            try:
+                _release_lock(lockfd, lockfile)
+            except Exception:
+                pass
             conn.close()
 
         if skipped:

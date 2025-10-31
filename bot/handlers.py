@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 import datetime
+import asyncio
 import math
 import dateutil.parser
 
@@ -59,6 +60,36 @@ async def send_message_safe(bot, chat_id: str, text: str) -> bool:
         return False
 
 
+async def missing_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle upload for a specific past date: /missing_upload YYYY-MM-DD"""
+    if not context.args:
+        await update.message.reply_text(
+            "Please provide a date in YYYY-MM-DD format.\n"
+            "Example: /missing_upload 2025-10-29"
+        )
+        return
+        
+    # Validate date format
+    date_str = context.args[0]
+    try:
+        # Parse and validate date
+        parsed_date = dateutil.parser.parse(date_str).date()
+        if parsed_date > datetime.date.today():
+            await update.message.reply_text("Cannot upload for future dates.")
+            return
+        # Store the target date in context for handle_document
+        context.user_data["pending_upload_date"] = parsed_date.isoformat()
+        await update.message.reply_text(
+            f"Please upload your Excel file for {parsed_date.isoformat()}.\n"
+            "The file will be processed for this specific date."
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "Invalid date format. Please use YYYY-MM-DD.\n"
+            "Example: /missing_upload 2025-10-29"
+        )
+        return
+
 async def help_cmd(update, context):
     """Show available commands based on user's permissions."""
     db_path = os.getenv("DB_PATH", "teleshop.db")
@@ -95,7 +126,8 @@ async def help_cmd(update, context):
         ("/help", "Show this help message"),
         ("/summary", "Show your current stock summary"),
         ("/my_stock", "Show your stock counts"),
-        ("/my_sales", "Show your sales for a date (optional)")
+        ("/my_sales", "Show your sales for a date (optional)"),
+        ("/missing_upload YYYY-MM-DD", "Upload sales Excel for a past date")
     ]
     admin_cmds = [
         ("/add_stock <user> <item> <qty>", "Add stock to a user"),
@@ -242,12 +274,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     from pathlib import Path
     db_path = os.getenv("DB_PATH", "teleshop.db")
 
-    # ---------------- Step 0: get username and name ----------------
+    # ---------------- Step 0: get username, name and date ----------------
     username = update.effective_user.username or str(update.effective_user.id)
     name = update.effective_user.full_name or username
-    report_date = datetime.date.today().isoformat()
-
-    logger.info(f"[UPLOAD] User={username}, Name={name}, Date={report_date}")
+    
+    # Check if this is a missing_upload with custom date
+    report_date = context.user_data.pop("pending_upload_date", None)
+    if not report_date:
+        report_date = datetime.date.today().isoformat()
+    
+    # Log with clear indication if this is a past-date upload
+    is_past_upload = report_date != datetime.date.today().isoformat()
+    logger.info(f"[UPLOAD] User={username}, Name={name}, Date={report_date}" + 
+                (" (past date upload)" if is_past_upload else ""))
 
     # ---------------- Step 1: get uploaded file ----------------
     doc = update.message.document
@@ -264,6 +303,69 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("Failed to download uploaded document: %s", ex)
         await update.message.reply_text("Failed to download file. Try again.")
         return
+
+    # ---------------- Step 2.5: two-step send_file flows ----------------
+    # If an admin previously ran /send_file or /sendfiletoall without attaching a file,
+    # the command stored a flag in context.user_data['awaiting_send_file'] which we'll handle here.
+    pending_send = context.user_data.pop("awaiting_send_file", None)
+    if pending_send:
+        try:
+            mode = pending_send.get("mode")
+            target = pending_send.get("target")  # may be None for broadcast
+            # Basic safety: only admins should be able to set this flag, check again
+            db_path = os.getenv("DB_PATH", "teleshop.db")
+            is_admin_db = await models.is_admin_by_username(db_path, update.effective_user.username or str(update.effective_user.id))
+            admin_ids = os.getenv("ADMIN_IDS", "")
+            admin_list = [a.strip() for a in admin_ids.split(",") if a.strip()]
+            is_admin_env = str(update.effective_user.id) in admin_list
+            if not (is_admin_db or is_admin_env):
+                await update.message.reply_text("You are not authorized to send files.")
+                return
+
+            # Size check (conservative): reject files larger than 48 MB to avoid Telegram limits
+            max_bytes = 48 * 1024 * 1024
+            if len(b) > max_bytes:
+                await update.message.reply_text("File too large to send (limit ~48MB).")
+                return
+
+            from telegram import InputFile as _InputFile
+            # Single target send
+            if mode == 'single' and target:
+                staff = await models.get_staff_by_username(db_path, target)
+                if not staff or not staff.get('chat_id'):
+                    await update.message.reply_text(f"Target {target} not found or has no chat_id registered.")
+                    return
+                try:
+                    await context.bot.send_document(chat_id=int(staff.get('chat_id')), document=_InputFile(bytes(b), filename=doc.file_name or 'file'))
+                    await update.message.reply_text(f"File sent to {target}.")
+                except Exception:
+                    logger.exception("Failed to send file to %s", target)
+                    await update.message.reply_text(f"Failed to send file to {target}.")
+                return
+
+            # Broadcast to all staff with chat_id
+            if mode == 'all':
+                chat_ids = await models.get_all_staff_chat_ids(db_path)
+                if not chat_ids:
+                    await update.message.reply_text("No staff chat_ids registered to broadcast.")
+                    return
+                sent = 0
+                failed = 0
+                for cid in chat_ids:
+                    try:
+                        await context.bot.send_document(chat_id=int(cid), document=_InputFile(bytes(b), filename=doc.file_name or 'file'))
+                        sent += 1
+                        # small throttle to avoid hitting rate limits
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        failed += 1
+                        logger.exception("Broadcast send failed for chat_id=%s", cid)
+                await update.message.reply_text(f"Broadcast complete: sent={sent}, failed={failed}")
+                return
+        except Exception:
+            logger.exception("Error handling awaiting_send_file flow")
+            await update.message.reply_text("Failed to process pending send file request.")
+            return
 
     # ---------------- Step 2: save uploaded Excel ----------------
     # Save uploaded file in per-employee subfolder: uploads/<username>/<original_filename>
@@ -331,11 +433,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Default: treat uploaded document as sales Excel (existing behavior)
         from utils.excel_utils import parse_sales_excel
         parsed = await asyncio.to_thread(parse_sales_excel, b, report_date, name)
-        if isinstance(parsed, tuple) and len(parsed) == 3:
-            entries, errors, daily_regs = parsed
+        # Support both old (3-tuple) and new (4-tuple) return shapes for backward compatibility
+        if isinstance(parsed, tuple):
+            if len(parsed) == 4:
+                entries, errors, daily_regs, should_remind_regs = parsed
+            elif len(parsed) == 3:
+                entries, errors, daily_regs = parsed
+                should_remind_regs = False
+            else:
+                raise ValueError(f"Unexpected parse_sales_excel return shape: {len(parsed)}")
+            # If we have a Notes column but no registrations found, remind them
+            if should_remind_regs:
+                await update.message.reply_text("⚠️ Reminder: Did you forget to report your daily registrations? Please include them in the Notes column (e.g., 'REG: 10').")
         else:
-            entries, errors = parsed
-            daily_regs = 0
+            # unexpected non-tuple result
+            raise ValueError("parse_sales_excel returned unexpected non-tuple result")
         logger.info(f"Parsed Excel: {len(entries)} entries, errors={errors}, daily_regs={daily_regs}")
     except Exception as ex:
         logger.exception("Failed parsing Excel: %s", ex)
@@ -445,6 +557,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         staff_id = await models.ensure_staff(db_path, username, name)
         logger.info(f"Ensured staff in DB: {username} (id={staff_id})")
+        # Rename the saved uploaded file to use the EmployeeName_Date.xlsx format
+        try:
+            # Prefer the staff name stored in DB (may include spaces); fall back to provided full name
+            staff_rec = await models.get_staff_by_username(db_path, username)
+            staff_name_for_file = (staff_rec.get('name') if staff_rec and staff_rec.get('name') else name) or username
+            # sanitize to alphanumeric only (remove spaces/special chars)
+            sanitized = ''.join([c for c in staff_name_for_file if c.isalnum()])
+            # use .xlsx extension for saved copies
+            ext = file_path.suffix if file_path.suffix else '.xlsx'
+            new_name = f"{sanitized}_{report_date}{ext}"
+            new_path = file_path.with_name(new_name)
+            try:
+                file_path.rename(new_path)
+                logger.info(f"Renamed uploaded file to {new_path}")
+                # update file_path variable so subsequent logic refers to new path
+                file_path = new_path
+            except Exception as rn_ex:
+                logger.warning(f"Failed to rename uploaded file {file_path} to {new_path}: {rn_ex}")
+        except Exception:
+            logger.exception("Failed to compute employee name for uploaded file rename")
     except Exception as ex:
         logger.exception("Failed to ensure staff in DB: %s", ex)
         await update.message.reply_text("Internal error: could not register user. Try again later.")
@@ -465,15 +597,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # ---------------- Step 6: last-upload-wins -> delete previous, then insert ----------------
     try:
-        # delete previous sales for this staff/date (revert inventory best-effort)
-        try:
-            deleted = await models.delete_sales_for_staff_date(db_path, staff_id, report_date)
-            if deleted:
-                logger.info(f"Deleted {deleted} previous sales for {username} on {report_date}")
-        except Exception:
-            logger.exception("Failed to delete previous sales for last-upload-wins")
-
-        # --- CRITICAL: Insert sales and update inventory atomically ---
+        # CRITICAL: Insert sales and update inventory atomically
+        # The delete_sales_for_staff_date is now handled inside insert_sales_and_update_inventory
+        # to ensure proper transaction atomicity and prevent race conditions
         result = await models.insert_sales_and_update_inventory(db_path, staff_id, report_date, entries)
         logger.info(f"insert_sales_and_update_inventory result: {result}")
         # save daily registrations if any
@@ -605,15 +731,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if daily_regs > 0:
         msg_lines.append(f"📝 Registrations today: {daily_regs}")
         
+    # Send the main success message first
+    await update.message.reply_text("\n".join(msg_lines))
+    
+    # Send warnings in a separate message if needed
+    warning_lines = []
+    
     # Show skipped rows from validation
     skipped_notices = context.user_data.pop("skipped_rows", [])
     if skipped_notices:
-        msg_lines.append("\n⚠️ Warning:")
-        msg_lines.extend(skipped_notices)
-        msg_lines.append("")
+        warning_lines.extend(["⚠️ Processing Warnings:", *skipped_notices])
         
     if parse_duplicates_skipped > 0:
-        msg_lines.append(f"⚠️ Skipped {parse_duplicates_skipped} duplicate SIM rows from upload.")
+        if warning_lines:
+            warning_lines.append("")
+        warning_lines.append(f"⚠️ Note: {parse_duplicates_skipped} duplicate SIM entries were automatically handled.")
+        
+    # Send warnings as a separate message if we have any
+    if warning_lines:
+        await update.message.reply_text("\n".join(warning_lines))
 
     try:
         await update.message.reply_text("\n".join(msg_lines))
@@ -1147,7 +1283,17 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         from pathlib import Path as _Path
         from telegram import InputFile as _InputFile
 
-        df = _pd.DataFrame([dict(r) for r in rows])
+        # Convert to DataFrame and rename/select columns
+        df = _pd.DataFrame([{
+            'Mobile': r['number'] or r.get('gsm_number', ''),  # Number field or gsm_field
+            'Amount': r['recharge_amount'],  # recharge_amount field
+            'Date': r['report_date'],  # report_date field
+            'Employee Name': r['employee']  # comes from st.name AS employee in query
+        } for r in rows])
+
+        # Ensure columns are in the exact order requested
+        df = df[['Mobile', 'Amount', 'Date', 'Employee Name']]
+        
         output_dir = _Path("reports")
         output_dir.mkdir(exist_ok=True)
         path = output_dir / f"recharge_report_herat_{parsed_date}.xlsx"
@@ -1157,6 +1303,102 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as ex:
         logger.exception("report generation failed: %s", ex)
         await update.message.reply_text("Failed generating report. Try again later.")
+
+
+@_require_admin
+async def send_file_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /send_file <username>
+
+    Send an attached document to a single staff member. Supports two-step flow:
+    - Run `/send_file <username>` then attach a file in the next message.
+    - Or run the command with a document attached.
+    """
+    db_path = os.getenv("DB_PATH", "teleshop.db")
+    if len(context.args) < 1:
+        # allow two-step: admin will run command then attach file
+        await update.message.reply_text("Usage: /send_file <username> (attach a document or run then attach)")
+        return
+    target = context.args[0]
+    doc = update.message.document
+    # If no document present, set two-step awaiting flag
+    if not doc:
+        context.user_data["awaiting_send_file"] = {"mode": "single", "target": target}
+        await update.message.reply_text(f"Please attach the file to send to {target} in your next message.")
+        return
+
+    # Immediate send: download and push
+    try:
+        file = await doc.get_file()
+        b = await file.download_as_bytearray()
+    except Exception:
+        logger.exception("Failed to download document for send_file")
+        await update.message.reply_text("Failed to download attached file. Try again.")
+        return
+
+    # size check
+    max_bytes = 48 * 1024 * 1024
+    if len(b) > max_bytes:
+        await update.message.reply_text("File too large to send (limit ~48MB).")
+        return
+
+    staff = await models.get_staff_by_username(db_path, target)
+    if not staff or not staff.get('chat_id'):
+        await update.message.reply_text("Target not found or has no chat_id registered.")
+        return
+
+    try:
+        from telegram import InputFile as _InputFile
+        await context.bot.send_document(chat_id=int(staff.get('chat_id')), document=_InputFile(bytes(b), filename=doc.file_name or 'file'))
+        await update.message.reply_text(f"File sent to {target}.")
+    except Exception:
+        logger.exception("send_file failed")
+        await update.message.reply_text("Failed to send file. See logs for details.")
+
+
+@_require_admin
+async def send_file_to_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: /sendfiletoall
+
+    Broadcast an attached document to all staff chat_ids. Supports two-step flow.
+    """
+    db_path = os.getenv("DB_PATH", "teleshop.db")
+    doc = update.message.document
+    if not doc:
+        context.user_data["awaiting_send_file"] = {"mode": "all"}
+        await update.message.reply_text("Please attach the file to broadcast to all staff in your next message.")
+        return
+
+    try:
+        file = await doc.get_file()
+        b = await file.download_as_bytearray()
+    except Exception:
+        logger.exception("Failed to download document for broadcast")
+        await update.message.reply_text("Failed to download attached file. Try again.")
+        return
+
+    max_bytes = 48 * 1024 * 1024
+    if len(b) > max_bytes:
+        await update.message.reply_text("File too large to broadcast (limit ~48MB).")
+        return
+
+    chat_ids = await models.get_all_staff_chat_ids(db_path)
+    if not chat_ids:
+        await update.message.reply_text("No staff chat_ids registered to broadcast.")
+        return
+
+    sent = 0
+    failed = 0
+    from telegram import InputFile as _InputFile
+    for cid in chat_ids:
+        try:
+            await context.bot.send_document(chat_id=int(cid), document=_InputFile(bytes(b), filename=doc.file_name or 'file'))
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+            logger.exception("Broadcast send failed for %s", cid)
+
+    await update.message.reply_text(f"Broadcast complete: sent={sent}, failed={failed}")
 
 
 async def all_sales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1221,10 +1463,13 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     per_shop = {}
     # also track recharge totals per shop
     per_shop_recharge = {}
+    # track recharge totals per employee for total AF calculation
+    per_employee_recharge = {}
     for r in rows:
         username = r['username']
         code = (r.get('item_code') or '').lower()
         recharge_amt = float(r.get('recharge_amount') or 0)
+        per_employee_recharge[username] = per_employee_recharge.get(username, 0.0) + recharge_amt
         # Count sales, not sum GSM numbers
         if username not in per_employee:
             per_employee[username] = {'SIM': 0, 'SWAP': 0, 'Credit50': 0, 'Credit100': 0}
@@ -1297,7 +1542,7 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return res
 
     # Helper to format employee line with proper alignment
-    def format_employee_line(name, stats, regs):
+    def format_employee_line(name, stats, regs, total_af: float = 0.0):
         parts = [f"👤 {name:<25}"]
         parts.append(f"SIM: {stats['SIM']:<3}")
         if stats['SWAP'] > 0:
@@ -1308,6 +1553,9 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parts.append(f"C50: {stats['Credit50']:<3}")
         if stats['Credit100'] > 0:
             parts.append(f"C100: {stats['Credit100']:<3}")
+        # Append total AF if provided
+        if total_af and total_af > 0:
+            parts.append(f"[total {total_af:.0f} AF]")
         return " | ".join(parts)
 
     # Build lines
@@ -1328,7 +1576,15 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             v = per_employee.get(username, {'SIM': 0, 'SWAP': 0, 'Credit50': 0, 'Credit100': 0})
             regs = per_employee_regs.get(username, 0)
             if v['SIM'] > 0 or v['SWAP'] > 0 or regs > 0 or v['Credit50'] > 0 or v['Credit100'] > 0:
-                block.append(format_employee_line(name, v, regs))
+                # compute total AF per employee: SIM*100 + SWAP*50 + C50*50 + C100*100 + recharge amounts
+                total_af = (
+                    v.get('SIM', 0) * 100
+                    + v.get('SWAP', 0) * 50
+                    + v.get('Credit50', 0) * 50
+                    + v.get('Credit100', 0) * 100
+                    + per_employee_recharge.get(username, 0.0)
+                )
+                block.append(format_employee_line(name, v, regs, total_af))
         block.append("")  # add spacing after each employee block
         return block
 
@@ -1571,6 +1827,7 @@ async def init_bot() -> Any:
     register_command(Command("summary", "Show your current stock summary"))
     register_command(Command("my_stock", "Show your stock counts"))
     register_command(Command("my_sales", "Show your sales for a date", usage="[date]"))
+    register_command(Command("missing_upload", "Upload sales Excel for a past date", usage="YYYY-MM-DD"))
 
     # Register admin commands
     register_command(Command("add_stock", "Add stock to a user", usage="<user> <item> <qty>", admin_only=True, category="Inventory"))
@@ -1585,6 +1842,7 @@ async def init_bot() -> Any:
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("my_stock", my_stock))
     app.add_handler(CommandHandler("my_sales", my_sales))
+    app.add_handler(CommandHandler("missing_upload", missing_upload))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     # admin handlers (wrapped with admin check in decorator usage)
     app.add_handler(CommandHandler("add_stock", _require_admin(add_stock_cmd)))
@@ -1602,6 +1860,9 @@ async def init_bot() -> Any:
     register_command(Command("register_me", "(Re)register chat_id for notifications"))
     register_command(Command("msg_user", "Send message to specific user", usage="<username> <message>", admin_only=True, category="Admin"))
     register_command(Command("msg_all", "Broadcast message to all users", usage="<message>", admin_only=True, category="Admin"))
+    # file send commands
+    register_command(Command("send_file", "Send a document to a user (attach file)", usage="<username>", admin_only=True, category="Admin"))
+    register_command(Command("sendfiletoall", "Broadcast a document to all users (attach file)", admin_only=True, category="Admin"))
     
     # Register borrow/money commands
     register_command(Command("borrow_add", "Record a money transaction", usage="<n> <amount> [note]", admin_only=True, category="Money"))
@@ -1632,6 +1893,9 @@ async def init_bot() -> Any:
     app.add_handler(CommandHandler("register_me", register_me))
     app.add_handler(CommandHandler("msg_user", _require_admin(msg_user_cmd)))
     app.add_handler(CommandHandler("msg_all", _require_admin(msg_all_cmd)))
+    # file send handlers
+    app.add_handler(CommandHandler("send_file", _require_admin(send_file_cmd)))
+    app.add_handler(CommandHandler("sendfiletoall", _require_admin(send_file_to_all_cmd)))
     app.add_handler(CommandHandler("borrow_add", _require_admin(borrow_add_cmd)))
     app.add_handler(CommandHandler("borrow_list", _require_admin(borrow_list_cmd)))
     app.add_handler(CommandHandler("borrow_summary", _require_admin(borrow_summary_cmd)))

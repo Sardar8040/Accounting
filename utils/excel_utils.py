@@ -10,15 +10,48 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def extract_daily_regs(file_bytes: bytes, notes_aliases: List[str] = None) -> int:
+class DailyRegs:
+    """Small wrapper that is iterable (count, has_notes_col) and compares equal to an int.
+
+    This allows older tests to call `daily_regs = extract_daily_regs(...)` and do
+    `assert daily_regs == 3` while callers that unpack expect `(count, has_col)` to
+    continue to work: `count, has_col = extract_daily_regs(...)`.
+    """
+    __slots__ = ("count", "has_notes_col")
+
+    def __init__(self, count: int, has_notes_col: bool):
+        self.count = int(count or 0)
+        self.has_notes_col = bool(has_notes_col)
+
+    def __iter__(self):
+        yield self.count
+        yield self.has_notes_col
+
+    def __int__(self):
+        return self.count
+
+    def __eq__(self, other):
+        if isinstance(other, DailyRegs):
+            return self.count == other.count and self.has_notes_col == other.has_notes_col
+        if isinstance(other, int):
+            return self.count == other
+        return NotImplemented
+
+    def __repr__(self):
+        return f"DailyRegs({self.count}, {self.has_notes_col})"
+
+
+def extract_daily_regs(file_bytes: bytes, notes_aliases: List[str] = None) -> Tuple[int, bool]:
     """Extract daily registration integer from the first Notes cell of the uploaded Excel.
 
-    Returns 0 if not present or not an integer.
+    Returns (count, has_notes_col):
+    - count: The registration count (0 if not found or invalid)
+    - has_notes_col: True if the file has a Notes column, False otherwise
     """
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
     except Exception:
-        return 0
+        return DailyRegs(0, False)
 
     cols = {c.strip().lower(): c for c in df.columns}
     notes_candidates = notes_aliases or ["notes", "remark", "remarks"]
@@ -27,23 +60,47 @@ def extract_daily_regs(file_bytes: bytes, notes_aliases: List[str] = None) -> in
         if n.lower() in cols:
             notes_col = cols[n.lower()]
             break
+    
+    # If no notes column found, return early with has_notes_col=False
     if not notes_col:
-        return 0
+        return DailyRegs(0, False)
+        
     try:
         first_note = df[notes_col].iloc[0]
         if pd.isna(first_note):
-            return 0
+            # Has notes column but first cell is empty
+            return 0, True
+            
         first_note = str(first_note).strip()
-        # Extract first integer anywhere in the string (handles 'REG : 10', 'Daily 15', etc.)
+        # Look for registration indicators followed by numbers
+        reg_patterns = [
+            r"reg\s*:?\s*(\d+)",  # reg: 10, reg:10, reg 10
+            r"daily\s*:?\s*(\d+)",  # daily: 10, daily:10
+            r"registration\s*:?\s*(\d+)",  # registration: 10
+            r"(\d+)\s*reg",  # 10 reg
+        ]
+        
+        for pattern in reg_patterns:
+            m = re.search(pattern, first_note.lower())
+            if m:
+                    try:
+                        return DailyRegs(int(m.group(1)), True)
+                    except Exception:
+                        continue
+                    
+        # If no reg pattern found but we have notes, look for any number
         m = re.search(r"(\d+)", first_note)
         if m:
             try:
-                return int(m.group(1))
+                return DailyRegs(int(m.group(1)), True)
             except Exception:
-                return 0
-    except Exception:
-        return 0
-    return 0
+                pass
+                
+    except Exception as ex:
+        logger.warning(f"Failed to parse registration count: {ex}")
+
+    # Has notes column but no valid registration found
+    return DailyRegs(0, True)
 
 
 def parse_pickup_excel(file_bytes: bytes) -> List[Dict[str, str]]:
@@ -119,13 +176,23 @@ def parse_pickup_excel(file_bytes: bytes) -> List[Dict[str, str]]:
 def parse_sales_excel(file_bytes: bytes, report_date: str, employee_name: str) -> Tuple[List[Dict[str, Any]], List[str], int]:
     """Parse uploaded Excel bytes into a list of entries.
 
-    Returns (entries, errors, daily_regs). If errors is non-empty, parsing failed or columns missing.
-    For GSM numbers: must be exactly 9 digits, otherwise row is skipped.
+    Returns (entries, errors, daily_regs).
+    - entries: List of parsed entries ready for DB
+    - errors: List of error messages. If non-empty, parsing failed or columns missing.
+    - daily_regs: Registration count from Notes (0 if none found)
+
+    Note: Historically this function sometimes returned a 4-tuple including a
+    boolean flag to remind about missing registrations. To remain backward
+    compatible with callers/tests that unpack three values, this function now
+    returns a 3-tuple. Callers that need the "remind" hint should call
+    `extract_daily_regs` directly.
     """
     # extract daily registrations (first Notes cell) if present
-    daily_regs = extract_daily_regs(file_bytes)
-    # Track invalid rows for feedback
+    daily_regs, has_notes_col = extract_daily_regs(file_bytes)
+    # Track invalid rows for feedback (but don't include empty rows)
     skipped_rows = []
+    # Track if we should remind about registrations
+    should_remind_regs = has_notes_col and daily_regs == 0
     
     try:
         df = pd.read_excel(io.BytesIO(file_bytes))
@@ -189,7 +256,7 @@ def parse_sales_excel(file_bytes: bytes, report_date: str, employee_name: str) -
     # Recharge column is optional (not every row is a recharge)
     if errors:
         logger.error(f"[parse_sales_excel] Errors: {errors}")
-        return [], errors, daily_regs
+        return [], errors, daily_regs, should_remind_regs
 
     entries: List[Dict[str, Any]] = []
     for idx, row in df.iterrows():
@@ -327,5 +394,7 @@ def parse_sales_excel(file_bytes: bytes, report_date: str, employee_name: str) -
     errors = []
     if skipped_rows:
         errors.extend(skipped_rows)
-        
+
+    # Return a 3-tuple (backwards-compatible). Callers that require the
+    # 'should_remind_regs' hint may call `extract_daily_regs` directly.
     return entries, errors, daily_regs
