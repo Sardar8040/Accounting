@@ -150,6 +150,119 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_admin_pending_table(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS admin_pending_uploads (
+            admin_id TEXT PRIMARY KEY,
+            target_username TEXT NOT NULL,
+            expires REAL NOT NULL
+        )
+        """
+    )
+    conn.commit()
+
+
+def set_admin_pending_upload(db_path: str, admin_id: str, target_username: str, ttl_seconds: int = 300) -> bool:
+    conn = get_connection(db_path)
+    try:
+        _ensure_admin_pending_table(conn)
+        cur = conn.cursor()
+        expires = time.time() + float(ttl_seconds)
+        cur.execute(
+            "INSERT OR REPLACE INTO admin_pending_uploads (admin_id, target_username, expires) VALUES (?, ?, ?)",
+            (str(admin_id), target_username, expires),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def pop_admin_pending_upload(db_path: str, admin_id: str) -> Optional[str]:
+    conn = get_connection(db_path)
+    try:
+        _ensure_admin_pending_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT target_username, expires FROM admin_pending_uploads WHERE admin_id = ?", (str(admin_id),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        target = row[0]
+        expires = float(row[1] or 0)
+        if expires < time.time():
+            # expired - remove
+            cur.execute("DELETE FROM admin_pending_uploads WHERE admin_id = ?", (str(admin_id),))
+            conn.commit()
+            return None
+        # remove and return
+        cur.execute("DELETE FROM admin_pending_uploads WHERE admin_id = ?", (str(admin_id),))
+        conn.commit()
+        return target
+    finally:
+        conn.close()
+
+
+def create_db_snapshot(db_path: str, backup_dir: str = "backups") -> str:
+    """Create a backup snapshot of the sqlite DB using the sqlite backup API.
+
+    Returns the path to the created backup file.
+    """
+    from pathlib import Path
+
+    p = Path(backup_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"teleshop_backup_{ts}.db"
+    backup_path = p / backup_name
+
+    # Use connections and the backup API for a consistent snapshot
+    src = get_connection(db_path)
+    dest = sqlite3.connect(str(backup_path))
+    try:
+        src.backup(dest)
+        dest.commit()
+    finally:
+        try:
+            dest.close()
+        except Exception:
+            pass
+        try:
+            src.close()
+        except Exception:
+            pass
+
+    return str(backup_path)
+
+
+def restore_db_from_snapshot(db_path: str, snapshot_path: str) -> bool:
+    """Restore the live DB from a snapshot file using the sqlite backup API.
+
+    Returns True on success.
+    """
+    # Ensure snapshot exists
+    if not os.path.exists(snapshot_path):
+        raise FileNotFoundError(snapshot_path)
+
+    # Open source (snapshot) and destination (live DB) and copy
+    src = sqlite3.connect(snapshot_path)
+    dest = get_connection(db_path)
+    try:
+        src.backup(dest)
+        dest.commit()
+        return True
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+        try:
+            dest.close()
+        except Exception:
+            pass
+
+
 def verify_table_exists(cur: sqlite3.Cursor, table_name: str) -> bool:
     """Check if a table exists in the database."""
     cur.execute(
@@ -1108,13 +1221,53 @@ async def get_sales_by_numbers(db_path: str, numbers: list) -> List[Dict[str, An
             return []
         conn = get_connection(db_path)
         cur = conn.cursor()
-        # build placeholders safely
-        placeholders = ",".join(["?"] * len(numbers))
-        query = f"SELECT sa.number as number, sa.report_date as report_date, st.username as username FROM sales sa JOIN staff st ON sa.staff_id = st.id WHERE sa.number IN ({placeholders})"
-        cur.execute(query, numbers)
+        # build placeholders safely for exact matches
+        exact_placeholders = ",".join(["?"] * len(numbers))
+        # compute last-9-digit variants for fuzzy matching (handles +93 or 0 prefixes)
+        last9s = [(n[-9:] if len(n) >= 9 else n) for n in numbers]
+        last9_placeholders = ",".join(["?"] * len(last9s))
+        # Query for exact matches OR last-9-digit matches using SQLite substr
+        query = (
+            f"SELECT sa.number as number, sa.report_date as report_date, st.username as username "
+            f"FROM sales sa JOIN staff st ON sa.staff_id = st.id "
+            f"WHERE sa.number IN ({exact_placeholders}) OR substr(sa.number, -9) IN ({last9_placeholders})"
+        )
+        cur.execute(query, numbers + last9s)
         rows = cur.fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    return await asyncio.to_thread(_fn)
+
+
+async def find_sales_for_number(db_path: str, number: str) -> List[Dict[str, Any]]:
+    """Find sales rows for a single number using several fuzzy matching strategies.
+
+    Returns list of dicts with keys: number, report_date, username, employee
+    """
+    def _fn():
+        if not number:
+            return []
+        # normalize to digits only for matching
+        s = ''.join([c for c in str(number) if c.isdigit()])
+        if not s:
+            return []
+        last9 = s[-9:] if len(s) >= 9 else s
+        conn = get_connection(db_path)
+        cur = conn.cursor()
+        try:
+            # Try exact match (normalized), exact (as-int) and last-9 fuzzy matches
+            query = (
+                "SELECT sa.number as number, sa.report_date as report_date, st.username as username, st.name as employee "
+                "FROM sales sa JOIN staff st ON sa.staff_id = st.id "
+                "WHERE sa.number = ? OR sa.number = ? OR substr(CAST(sa.number AS TEXT), -9) = ? OR sa.number LIKE '%' || ?"
+            )
+            params = [s, str(int(s)) if s.isdigit() else s, last9, last9]
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     return await asyncio.to_thread(_fn)
 

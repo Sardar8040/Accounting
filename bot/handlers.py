@@ -368,6 +368,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
     # ---------------- Step 2: save uploaded Excel ----------------
+    # Check for admin 'upload_for' pending session: if an admin previously ran /upload_for <username>
+    try:
+        # import at runtime to avoid circular import during module load
+        from . import admin_commands
+        pending_target = admin_commands.pop_pending_upload(update.effective_user.id)
+    except Exception:
+        pending_target = None
+
+    # If admin pending upload exists, we will process this file as belonging to that employee.
+    if pending_target:
+        # verify the target exists and is registered (has chat_id) per the safety requirement
+        try:
+            staff = await models.get_staff_by_username(db_path, pending_target)
+            if not staff or not staff.get('chat_id'):
+                await update.message.reply_text(f"⚠️ Employee not found or not linked to Telegram: {pending_target}. Upload cancelled.")
+                return
+            # override the uploader username so subsequent logic treats file as uploaded by the target
+            admin_initiator = update.effective_user.username or str(update.effective_user.id)
+            username = pending_target
+            name = staff.get('name') or username
+            # record flag so we can notify the employee after processing
+            context.user_data['admin_upload_for'] = {'target': pending_target, 'initiator': admin_initiator}
+        except Exception:
+            await update.message.reply_text("⚠️ Failed to validate target employee for admin upload. Upload cancelled.")
+            return
+
     # Save uploaded file in per-employee subfolder: uploads/<username>/<original_filename>
     base_upload_dir = Path("uploads")
     staff_upload_dir = base_upload_dir / username
@@ -700,15 +726,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         sset.add(n)
                         uniq.append(n)
                     existing = await models.get_sales_by_numbers(db_path, uniq)
-                    if existing:
-                        existing_map = {r.get('number'): r for r in existing}
-                        for n in uniq:
-                            r = existing_map.get(n)
-                            if r:
+                    # Build duplicates_detected entries for all dup numbers; if we found DB rows use them,
+                    # otherwise still report the raw number so the uploader knows which GSMs were skipped.
+                    existing_map = {r.get('number'): r for r in existing} if existing else {}
+                    for n in uniq:
+                        r = existing_map.get(n)
+                        if r:
+                            duplicates_detected.append({
+                                "number": n,
+                                "report_date": r.get("report_date"),
+                                "username": r.get("username"),
+                            })
+                        else:
+                            # Try a fuzzy lookup for this single number to resolve staff/report_date
+                            try:
+                                found = await models.find_sales_for_number(db_path, n)
+                                if found:
+                                    fr = found[0]
+                                    duplicates_detected.append({
+                                        "number": n,
+                                        "report_date": fr.get("report_date"),
+                                        "username": fr.get("username") or fr.get("employee"),
+                                    })
+                                else:
+                                    duplicates_detected.append({
+                                        "number": n,
+                                        "report_date": None,
+                                        "username": None,
+                                    })
+                            except Exception:
                                 duplicates_detected.append({
                                     "number": n,
-                                    "report_date": r.get("report_date"),
-                                    "username": r.get("username"),
+                                    "report_date": None,
+                                    "username": None,
                                 })
         except Exception:
             logger.exception("Failed to enrich duplicate numbers from inserter result")
@@ -893,12 +943,52 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if admin_notify:
             # send to the designated admin chat id
             await send_message_safe(context.bot, admin_notify, admin_text)
+            # also send the exact uploaded file as a document to the admin notify chat
+            try:
+                from telegram import InputFile
+                await context.bot.send_document(chat_id=int(admin_notify), document=InputFile(str(file_path), filename=file_path.name))
+            except Exception:
+                logger.exception("Failed to send uploaded file to admin_notify chat")
         else:
             admin_chat_ids = await models.get_all_admin_chat_ids(db_path)
             for cid in admin_chat_ids:
                 await send_message_safe(context.bot, cid, admin_text)
+                # also send the uploaded file to each admin chat id where possible
+                try:
+                    from telegram import InputFile
+                    await context.bot.send_document(chat_id=int(cid), document=InputFile(str(file_path), filename=file_path.name))
+                    # small throttle
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    logger.exception("Failed to send uploaded file to admin chat_id=%s", cid)
     except Exception:
         logger.exception("Failed to notify admins of uploaded sales")
+
+    # If this was an admin-upload-for flow, notify the target employee that an admin uploaded on their behalf
+    try:
+        pending = context.user_data.pop('admin_upload_for', None)
+        if pending:
+            target = pending.get('target')
+            initiator = pending.get('initiator')
+            # get staff info to find chat_id
+            staff = await models.get_staff_by_username(db_path, target)
+            if staff and staff.get('chat_id'):
+                # Compose a short summary to notify the employee
+                notify_lines = [f"📢 Your sales report for {report_date} was uploaded by admin {initiator}."]
+                # reuse msg_lines which contains totals
+                notify_lines += ["Summary:"]
+                notify_lines += msg_lines
+                try:
+                    await send_message_safe(context.bot, staff.get('chat_id'), "\n".join(notify_lines))
+                except Exception:
+                    logger.exception("Failed to notify employee about admin upload")
+            # confirm to admin (uploader) as well
+            try:
+                await update.message.reply_text(f"✅ Sales file uploaded successfully for user \"{target}\". Processed and saved.")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Failed to run admin-upload notification flow")
 
 
 
@@ -966,14 +1056,51 @@ async def list_inventory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not rows:
         await update.message.reply_text("No inventory records.")
         return
-    # nice styled table-like output but plain text
-    header = f"{'User':<15} {'SIM':>5} {'SWAP':>6} {'C50':>6} {'C100':>6}"
-    sep = "".join(["-" for _ in range(len(header))])
-    lines = ["📦 Current Inventories:", header, sep]
+    # Helper: get first name and truncate to width
+    def _first_name(full: str) -> str:
+        if not full:
+            return ""
+        # prefer the 'name' token (e.g., "Wakil Ahmad Ghori" -> "Wakil")
+        parts = str(full).strip().split()
+        return parts[0] if parts else str(full)[:10]
+
+    def _truncate(s: str, w: int) -> str:
+        s = str(s or "")
+        if len(s) <= w:
+            return s
+        if w <= 1:
+            return s[:w]
+        return s[: w - 1] + "…"
+
+    # Fixed column widths
+    name_w = 10
+    sim_w = 5
+    swap_w = 5
+    c50_w = 5
+    c100_w = 5
+
+    # Build boxed table using unicode box chars for readability
+    top = f"╔{'═' * (name_w+2)}╦{'═' * (sim_w+2)}╦{'═' * (swap_w+2)}╦{'═' * (c50_w+2)}╦{'═' * (c100_w+2)}╗"
+    header = (
+        f"║ {'User'.ljust(name_w)} ║ {'SIM'.rjust(sim_w)} ║ {'SWP'.rjust(swap_w)} ║ {'C50'.rjust(c50_w)} ║ {'C100'.rjust(c100_w)} ║"
+    )
+    sep = f"╠{'═' * (name_w+2)}╬{'═' * (sim_w+2)}╬{'═' * (swap_w+2)}╬{'═' * (c50_w+2)}╬{'═' * (c100_w+2)}╣"
+    bottom = f"╚{'═' * (name_w+2)}╩{'═' * (sim_w+2)}╩{'═' * (swap_w+2)}╩{'═' * (c50_w+2)}╩{'═' * (c100_w+2)}╝"
+
+    lines = ["📦 Current Inventories:", top, header, sep]
     for r in rows:
-        uname = r.get('username') or ''
-        name = r.get('name') or ''
-        lines.append(f"{uname:<15} {r.get('sim',0):>5} {r.get('swap',0):>6} {r.get('credit_50',0):>6} {r.get('credit_100',0):>6}  {name}")
+        name_raw = r.get('name') or r.get('username') or ''
+        short = _first_name(name_raw)
+        short = _truncate(short, name_w)
+        sim = str(r.get('sim', 0))
+        swap = str(r.get('swap', 0))
+        c50 = str(r.get('credit_50', 0))
+        c100 = str(r.get('credit_100', 0))
+        line = (
+            f"║ {short.ljust(name_w)} ║ {sim.rjust(sim_w)} ║ {swap.rjust(swap_w)} ║ {c50.rjust(c50_w)} ║ {c100.rjust(c100_w)} ║"
+        )
+        lines.append(line)
+    lines.append(bottom)
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1670,7 +1797,24 @@ async def total_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Helper to format employee line with proper alignment
     def format_employee_line(name, stats, regs, total_af: float = 0.0):
-        parts = [f"👤 {name:<25}"]
+        # Use only first name truncated for compact lines
+        def _first_name(full: str) -> str:
+            if not full:
+                return ""
+            parts = str(full).strip().split()
+            return parts[0] if parts else str(full)
+
+        def _truncate(s: str, w: int) -> str:
+            s = str(s or "")
+            if len(s) <= w:
+                return s
+            if w <= 1:
+                return s[:w]
+            return s[: w - 1] + "…"
+
+        short = _first_name(name)
+        short = _truncate(short, 10)
+        parts = [f"👤 {short:<10}"]
         parts.append(f"SIM: {stats['SIM']:<3}")
         if stats['SWAP'] > 0:
             parts.append(f"SWAP: {stats['SWAP']:<3}")
@@ -2004,6 +2148,25 @@ async def init_bot() -> Any:
     register_command(Command("backoffice_add", "Add central backoffice stock", usage="<item> <qty>", admin_only=True, category="Backoffice"))
     register_command(Command("backoffice_list", "List backoffice stock", admin_only=True, category="Backoffice"))
     register_command(Command("transfer_backoffice", "Transfer from backoffice", usage="<user> <item> <qty>", admin_only=True, category="Backoffice"))
+
+    # Register admin maintenance commands (defined in bot.admin_commands)
+    try:
+        from . import admin_commands
+        register_command(Command("update_inventory", "Update a user's inventory", usage="<username> SIM=<n> SWAP=<n> C50=<n> C100=<n>", admin_only=True, category="Admin"))
+        register_command(Command("update_reg", "Update daily registrations", usage="<username> <value>", admin_only=True, category="Admin"))
+        register_command(Command("reset_inventory", "Reset a user's inventory to zeros", usage="<username>", admin_only=True, category="Admin"))
+        register_command(Command("view_inventory", "View a user's inventory", usage="<username>", admin_only=True, category="Admin"))
+        register_command(Command("upload_for", "Upload a sales file on behalf of a user", usage="<username>", admin_only=True, category="Admin"))
+        # add handlers wrapped with _require_admin
+        app.add_handler(CommandHandler("update_inventory", _require_admin(admin_commands.update_inventory_cmd)))
+        app.add_handler(CommandHandler("update_reg", _require_admin(admin_commands.update_reg_cmd)))
+        app.add_handler(CommandHandler("reset_inventory", _require_admin(admin_commands.reset_inventory_cmd)))
+        app.add_handler(CommandHandler("view_inventory", _require_admin(admin_commands.view_inventory_cmd)))
+        app.add_handler(CommandHandler("upload_for", _require_admin(admin_commands.upload_for_cmd)))
+    except Exception:
+        # if admin_commands missing, continue silently (no breakage)
+        import logging as _logging
+        _logging.getLogger(__name__).warning("admin_commands module not available; admin utilities not registered")
     
     # Register SIM batch commands
     register_command(Command("import_pickup", "Import SIM pickup list Excel", admin_only=True, category="SIM"))
