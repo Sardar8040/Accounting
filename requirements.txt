@@ -1,6 +1,11 @@
 pandas
-python-telegram-bot~=21.0
+# pin to a stable v20.x release for compatibility with python-telegram-bot v20 APIs
+python-telegram-bot==20.3
 python-dotenv
 openpyxl
 python-dateutil
 pytest
+# compatibility constraints for httpx/httpcore/sniffio used by telegram packages
+httpx<0.25
+httpcore<0.18
+sniffio<1.4
