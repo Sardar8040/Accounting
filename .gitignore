@@ -1,0 +1,32 @@
+# Virtual environments
+venv/
+.venv/
+.venv312/
+env/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Environment files
+.env
+
+# Local databases and uploads
+teleshop.db
+test_last_upload_wins.db
+*.sqlite3
+uploads/
+reports/
+
+# pytest cache
+.pytest_cache/
