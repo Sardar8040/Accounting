@@ -522,6 +522,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     filtered_entries = []
     seen_identifiers = set()
     parse_duplicates_skipped = 0
+    parse_duplicates_list = []
     for e in entries:
         try:
             item_code = (e.get("item_code") or "").lower()
@@ -538,11 +539,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     if s.isdigit() and len(s) >= 6:
                         identifier = s
 
-            if identifier and item_code in ("sim", "simcard", "sim_card"):
-                if identifier in seen_identifiers:
-                    parse_duplicates_skipped += 1
-                    continue
-                seen_identifiers.add(identifier)
+                if identifier and item_code in ("sim", "simcard", "sim_card"):
+                    if identifier in seen_identifiers:
+                        parse_duplicates_skipped += 1
+                        parse_duplicates_list.append(identifier)
+                        continue
+                    seen_identifiers.add(identifier)
 
             # otherwise keep the row
             filtered_entries.append(e)
@@ -828,20 +830,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if warning_lines:
         await update.message.reply_text("\n".join(warning_lines))
 
-        try:
-            await update.message.reply_text("\n".join(msg_lines))
-            # notify employee about duplicate rows if any
-            # Prefer explicit duplicates_detected list (with dates) when available
-            if duplicates_detected:
-                lines = ["⚠️ Some rows were duplicates and were ignored.", "Duplicates:"]
-                for d in duplicates_detected:
-                    lines.append(f"GSM Number: {d.get('number')}, Sold on: {d.get('report_date')}, By: {d.get('username')}")
-                lines.append("Only new entries were processed successfully.")
-                await update.message.reply_text("\n".join(lines))
-            elif isinstance(result, dict) and result.get("duplicates_skipped"):
-                await update.message.reply_text("⚠️ Some rows were duplicates and were ignored. Only new entries were processed.")
-        except Exception:
-            logger.exception("Failed to send upload summary message to employee")
+    # Notify employee about duplicates (both parse-time and DB-level) regardless of warnings
+    try:
+        dup_lines = []
+        if parse_duplicates_list:
+            dup_lines.append("⚠️ Duplicate entries found within your uploaded file (ignored):")
+            for n in parse_duplicates_list:
+                dup_lines.append(f"GSM Number: {n} (duplicate in file)")
+            dup_lines.append("")
+
+        if duplicates_detected:
+            dup_lines.append("⚠️ Some rows were duplicates against existing sales and were ignored:")
+            for d in duplicates_detected:
+                dup_lines.append(f"GSM Number: {d.get('number')}, Sold on: {d.get('report_date')}, By: {d.get('username')}")
+            dup_lines.append("")
+
+        # fallback: if no detailed list but DB reported duplicates via result key, show generic notice
+        if not dup_lines and isinstance(result, dict) and result.get("duplicates_skipped"):
+            dup_lines.append("⚠️ Some rows were duplicates and were ignored. Only new entries were processed.")
+
+        if dup_lines:
+            dup_lines.append("Only new entries were processed successfully.")
+            await update.message.reply_text("\n".join(dup_lines))
+    except Exception:
+        logger.exception("Failed to send upload summary message to employee")
 
     # Notify admins (by stored chat_id) with the same summary
     try:
