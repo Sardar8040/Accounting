@@ -681,6 +681,37 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # to ensure proper transaction atomicity and prevent race conditions
         result = await models.insert_sales_and_update_inventory(db_path, staff_id, report_date, entries)
         logger.info(f"insert_sales_and_update_inventory result: {result}")
+        # If our pre-check didn't find DB-level duplicates but the inserter recorded dup_number skips,
+        # resolve those numbers to original sale info so we can report them back to the user.
+        try:
+            if not duplicates_detected and isinstance(result, dict):
+                skipped_list = result.get("skipped") or []
+                dup_nums = []
+                for it in skipped_list:
+                    if isinstance(it, str) and it.startswith("dup_number:"):
+                        dup_nums.append(it.split(":", 1)[1])
+                if dup_nums:
+                    # dedupe
+                    uniq = []
+                    sset = set()
+                    for n in dup_nums:
+                        if n in sset:
+                            continue
+                        sset.add(n)
+                        uniq.append(n)
+                    existing = await models.get_sales_by_numbers(db_path, uniq)
+                    if existing:
+                        existing_map = {r.get('number'): r for r in existing}
+                        for n in uniq:
+                            r = existing_map.get(n)
+                            if r:
+                                duplicates_detected.append({
+                                    "number": n,
+                                    "report_date": r.get("report_date"),
+                                    "username": r.get("username"),
+                                })
+        except Exception:
+            logger.exception("Failed to enrich duplicate numbers from inserter result")
         # save daily registrations if any
         try:
             if daily_regs and int(daily_regs) > 0:
